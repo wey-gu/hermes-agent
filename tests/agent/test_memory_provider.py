@@ -2,7 +2,7 @@
 
 import json
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager
@@ -89,6 +89,23 @@ class MessagesMemoryProvider(FakeMemoryProvider):
 
     def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
+
+
+class LazyToolMemoryProvider(FakeMemoryProvider):
+    """Provider whose tools appear only after initialize().
+
+    This matches plugins that need initialization to decide availability or
+    build a client, but still rely on MemoryManager routing for native tools.
+    """
+
+    def __init__(self, name="lazy", available=True, tools=None):
+        super().__init__(name=name, available=available, tools=tools)
+        self._tools_after_init = list(tools or [])
+        self._tools = []
+
+    def initialize(self, session_id, **kwargs):
+        super().initialize(session_id, **kwargs)
+        self._tools = list(self._tools_after_init)
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +654,31 @@ class TestSequentialDispatchRouting:
 
         names = mgr.get_all_tool_names()
         assert names == {"builtin_tool", "ext_recall", "ext_retain"}
+
+    def test_initialize_all_reindexes_tools_added_during_initialize(self):
+        """Tools that appear only after initialize() must still route.
+
+        Regression test for providers that returned no tool schemas during
+        add_provider(), then populated schemas during initialize().
+        """
+        mgr = MemoryManager()
+        provider = LazyToolMemoryProvider("nowledge-mem", tools=[
+            {"name": "nmem_save", "description": "Save", "parameters": {}},
+            {"name": "nmem_search", "description": "Search", "parameters": {}},
+        ])
+        mgr.add_provider(provider)
+
+        assert not mgr.has_tool("nmem_save")
+        assert mgr.get_all_tool_schemas() == []
+
+        mgr.initialize_all(session_id="lazy-session")
+
+        assert mgr.has_tool("nmem_save")
+        assert mgr.has_tool("nmem_search")
+
+        result = json.loads(mgr.handle_tool_call("nmem_save", {"content": "test"}))
+        assert result["handled"] == "nmem_save"
+        assert result["args"] == {"content": "test"}
 
 
 # ---------------------------------------------------------------------------
